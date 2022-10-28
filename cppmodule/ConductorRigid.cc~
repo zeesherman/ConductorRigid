@@ -1,0 +1,637 @@
+#ifdef WIN32
+#pragma warning( push )
+#pragma warning( disable : 4244 )
+#endif
+
+#include <boost/python.hpp>
+using namespace boost::python;
+#include <boost/bind.hpp>
+using namespace boost;
+#include <boost/math/special_functions/bessel.hpp>
+
+#include "ConductorRigid.h"
+#include "ConductorRigid.cuh"
+#include "PotentialWrapper.cuh"
+#include "PreconditionWrapper.cuh"
+#include <stdio.h>
+#include <algorithm>
+
+#define PI 3.1415926535897932
+
+// ConductorRigid.cc:  Contains code for the ConductorRigid class
+
+// Constructor for the ConductorRigid class
+ConductorRigid::ConductorRigid( boost::shared_ptr<SystemDefinition> sysdef, // system this method will act on; must not be NULL
+				boost::shared_ptr<ParticleGroup> group, // group of particles in which to compute the force
+				boost::shared_ptr<NeighborList> nlist, // neighbor list
+				boost::python::list body, // index of the isolated body each bead belongs to
+				boost::python::list charge, // known isolated body charges
+				boost::python::list field, // imposed external field
+				Scalar xi, // Ewald splitting parameter
+				Scalar errortol, // error tolerance
+				std::string fileprefix, // output file array
+				int period, // output file period
+				int t0) // initial time step 
+				: ForceCompute(sysdef),
+				m_group(group),
+				m_nlist(nlist),
+				m_extfield(make_scalar3(boost::python::extract<Scalar>(field[0]), boost::python::extract<Scalar>(field[1]), boost::python::extract<Scalar>(field[2]))),
+				m_xi(xi),
+				m_errortol(errortol),
+				m_fileprefix(fileprefix),
+				m_period(period),
+				m_t0(t0)
+{
+    	m_exec_conf->msg->notice(5) << "Constructing ConductorRigid." << std::endl;
+
+	// only one GPU is supported
+	if (!exec_conf->isCUDAEnabled())
+	{
+		m_exec_conf->msg->error() << "Creating a ConductorRigid when CUDA is disabled" << std::endl;
+		throw std::runtime_error("Error initializing ConductorRigid");
+	}
+
+	// Get the total number of particles
+	m_N_total = m_pdata->getN();
+
+	// Get the system rigid data
+        m_rigid_data = sysdef->getRigidData();
+
+        // Get group sizes
+        m_N_rigid = m_rigid_data->getNumBodies(); // number of rigid bodies
+	m_RigidGroup_size = m_rigid_data->getNumIndexRigid(); // number of beads belonging to rigid bodies
+	m_group_size = m_group->getNumMembers(); // number of beads in the active group
+	int N_isolated_beads = m_group_size - m_RigidGroup_size; // number of isolated beads
+	m_N_isolated = m_N_rigid + N_isolated_beads; // number of isolated bodies (rigid bodies + isolated beads)
+	int max_rigid_size = m_rigid_data->getNmax();
+	ArrayHandle<unsigned int> d_rigid_size(m_rigid_data->getBodySize(), access_location::host, access_mode::read);
+
+	printf("\n\n");
+	m_exec_conf->msg->notice(2) << "--- Rigid Data ---" << std::endl;
+	m_exec_conf->msg->notice(2) << "Total number of particles: " << m_N_total << std::endl;
+	m_exec_conf->msg->notice(2) << "Number of active particles: " << m_group_size << std::endl;
+	m_exec_conf->msg->notice(2) << "Number of rigid bodies: " << m_N_rigid << std::endl;
+	m_exec_conf->msg->notice(2) << "Number of particles in rigid bodies: " << m_RigidGroup_size << std::endl;
+	m_exec_conf->msg->notice(2) << "Maximum rigid body size: " << max_rigid_size << std::endl;
+	m_exec_conf->msg->notice(2) << "Rigid body size: " << d_rigid_size.data[0] << std::endl;
+	m_exec_conf->msg->notice(2) << "Number of isolated beads: " << N_isolated_beads << std::endl;
+	m_exec_conf->msg->notice(2) << "Number of isolated bodies: " << m_N_isolated << std::endl;
+	printf("\n\n");
+
+	// Check if there are any rigid bodies
+        if (m_N_rigid == 0)
+        {
+            m_exec_conf->msg->warning() << "ConductorRigid: Empty group." << std::endl;
+        }
+
+	// Initialize the unsorted isolated tag array
+	GPUArray<unsigned int> n_isolated_membership_unsrt(m_N_total, exec_conf);
+	m_isolated_membership_unsrt.swap(n_isolated_membership_unsrt);
+	ArrayHandle<unsigned int> h_isolated_membership_unsrt(m_isolated_membership_unsrt, access_location::host, access_mode::readwrite);
+
+	// Fill the unsorted isolated tag array
+	for (int i = 0; i < m_N_total; ++i ){
+		h_isolated_membership_unsrt.data[i] = boost::python::extract<unsigned int>(body[i]);
+	}
+
+	// Initialize the isolated body charge array
+	GPUArray<Scalar> n_isolated_charge(m_N_isolated, exec_conf);
+	m_isolated_charge.swap(n_isolated_charge);
+	ArrayHandle<Scalar> h_isolated_charge(m_isolated_charge, access_location::host, access_mode::readwrite);
+
+	// Fill the charge array
+	for (int i = 0; i < m_N_isolated; ++i ){
+		h_isolated_charge.data[i] = boost::python::extract<Scalar>(charge[i]);
+	}
+}
+
+// Destructor for the ConductorRigid class
+ConductorRigid::~ConductorRigid() {
+
+    m_exec_conf->msg->notice(5) << "Destroying ConductorRigid" << std::endl;
+	cufftDestroy(m_plan);
+}
+
+// Set parameters needed for the calculations
+void ConductorRigid::SetParams() {
+
+	////// Compute parameters associated with the numerical method.
+
+	const BoxDim& box = m_pdata->getBox(); // simulation box
+	Scalar3 L = box.getL(); // simulation box dimensions
+
+	m_rc = sqrtf(-logf(m_errortol))/m_xi;  // real space cutoff radius
+	Scalar kcut = 2.0*m_xi*sqrtf(-logf(m_errortol));  // wave space cutoff
+	m_Nx = int(ceil(1.0 + L.x*kcut/PI));  // number of grid nodes in the x direction
+	m_Ny = int(ceil(1.0 + L.y*kcut/PI));  // number of grid nodes in the y direction
+	m_Nz = int(ceil(1.0 + L.z*kcut/PI));  // number of grid nodes in the z direction
+
+	// Get list of 5-smooth integers between 8 and 4096 (can be written as (2^a)*(3^b)*(5^c); i.e. only prime factors of 2, 3, and 5)
+	std::vector<int> Mlist;
+	for ( int ii = 0; ii < 13; ++ii ){
+		int pow2 = 1;
+		for ( int i = 0; i < ii; ++i ){
+			pow2 *= 2;
+		}
+		for ( int jj = 0; jj < 8; ++jj ){
+			int pow3 = 1;
+			for ( int j = 0; j < jj; ++j ){
+				pow3 *= 3;
+			}
+			for ( int kk = 0; kk < 6; ++kk ){
+				int pow5 = 1;
+				for ( int k = 0; k < kk; ++k ){
+					pow5 *= 5;
+				}
+				int Mcurr = pow2 * pow3 * pow5;
+				if ( Mcurr >= 8 && Mcurr <= 4096 ){
+					Mlist.push_back(Mcurr);
+				}
+			}
+		}
+	}
+
+	// Sort the list from lowest to highest
+	std::sort(Mlist.begin(), Mlist.end());
+
+	// Get the length of the list (131 5-smooth integers)
+	const int nmult = Mlist.size();	
+
+	// Set the number of grid points to be a 5-smooth integer for most efficient FFTs
+	for ( int ii = 0; ii < nmult; ++ii ){
+		if (m_Nx <= Mlist[ii]){
+			m_Nx = Mlist[ii];
+			break;
+		}
+	}
+	for ( int ii = 0; ii < nmult; ++ii ){
+		if (m_Ny <= Mlist[ii]){
+			m_Ny = Mlist[ii];
+			break;
+		}
+	}
+	for ( int ii = 0; ii < nmult; ++ii ){
+		if (m_Nz <= Mlist[ii]){
+			m_Nz = Mlist[ii];
+			break;
+		}
+	}
+
+	// Prevent grid sizes larger than 4096 in any dimension
+	if ( m_Nx > 4096 || m_Ny > 4096 || m_Nz > 4096 ){
+
+		printf("Requested number of Fourier nodes exceeds maximum of 4096.\n");
+		printf("Mx = %i \n", m_Nx);
+		printf("My = %i \n", m_Ny);
+		printf("Mz = %i \n", m_Nz);
+
+		exit(EXIT_FAILURE);
+	}
+
+	// Total number of grid nodes
+	Scalar N_grid = m_Nx*m_Ny*m_Nz;
+
+	// Issue a memory warning if there are too many total grid nodes
+	if (N_grid > 512*512*512){
+		printf("WARNING: Number of total grid nodes is larger than 512^3.  Calculation may fail due to GPU memory limitations. Try decreasing the error tolerance or decreasing the Ewald splitting parameter.\n");
+	}
+
+	// Additional parameters
+	m_gridh = L / make_scalar3(m_Nx,m_Ny,m_Nz); // grid spacing
+	m_P = ceil(-2.0*logf(m_errortol)/PI);  // number of grid nodes over which to support spreading and contracting kernels
+	m_eta = m_P*m_gridh*m_gridh*m_xi*m_xi/PI; // Spectral splitting parameter
+
+	// Cannot support more nodes than the grid size
+	if (m_P > m_Nx) m_P = m_Nx;
+	if (m_P > m_Ny) m_P = m_Ny;		     
+	if (m_P > m_Nz) m_P = m_Nz;
+
+	// Print summary to command line output
+	printf("\n");
+	printf("\n");
+	m_exec_conf->msg->notice(2) << "--- Parameters ---" << std::endl;
+	m_exec_conf->msg->notice(2) << "Box dimensions: " << L.x << ", " << L.y << ", " << L.z << std::endl;
+	m_exec_conf->msg->notice(2) << "Ewald parameter xi: " << m_xi << std::endl;
+	m_exec_conf->msg->notice(2) << "Error tolerance: " << m_errortol << std::endl;
+	m_exec_conf->msg->notice(2) << "Real space cutoff: " << m_rc << std::endl;
+	m_exec_conf->msg->notice(2) << "Wave space cutoff: " << kcut << std::endl;
+	m_exec_conf->msg->notice(2) << "Grid nodes in each dimension: " << m_Nx << ", " << m_Ny << ", " << m_Nz << std::endl;
+	m_exec_conf->msg->notice(2) << "Grid spacing: " << m_gridh.x << ", " << m_gridh.y << ", " << m_gridh.z << std::endl;
+	m_exec_conf->msg->notice(2) << "Spectral parameter eta: " << m_eta.x << ", " << m_eta.y << ", " << m_eta.z << std::endl;
+	m_exec_conf->msg->notice(2) << "Support P: " << m_P << std::endl;
+	printf("\n");
+	printf("\n");
+
+	////// Wave space grid
+
+	// Create plan for FFTs on the GPU
+	cufftPlan3d(&m_plan, m_Nx, m_Ny, m_Nz, CUFFT_C2C);	
+
+	// Wave vector at each grid point
+	GPUArray<Scalar3> n_gridk(N_grid, exec_conf); // declare
+	m_gridk.swap(n_gridk); // initialize
+	ArrayHandle<Scalar3> h_gridk(m_gridk, access_location::host, access_mode::readwrite);
+
+	// Wave space scalings
+	GPUArray<Scalar> n_scale_phiq(N_grid, exec_conf);
+	m_scale_phiq.swap(n_scale_phiq);
+	ArrayHandle<Scalar> h_scale_phiq(m_scale_phiq, access_location::host, access_mode::readwrite);
+
+	// Grid arrays
+	GPUArray<CUFFTCOMPLEX> n_qgrid(N_grid, exec_conf);
+	m_qgrid.swap(n_qgrid);
+
+	// Populate grids with wave-space vectors and scalings
+	for (int i = 0; i < m_Nx; i++) {
+	  for (int j = 0; j < m_Ny; j++) {
+	    for (int k = 0; k < m_Nz; k++) {
+
+		// Index into grid vector storage array
+		int idx = i*m_Ny*m_Nz + j*m_Nz + k;
+
+		// wave vector components goes from -2*PI*N/2 to 2*PI*N/2
+		h_gridk.data[idx].x = ((i < (m_Nx+1)/2) ? i : i - m_Nx) * 2.0*PI/L.x;
+		h_gridk.data[idx].y = ((j < (m_Ny+1)/2) ? j : j - m_Ny) * 2.0*PI/L.y;
+		h_gridk.data[idx].z = ((k < (m_Nz+1)/2) ? k : k - m_Nz) * 2.0*PI/L.z;
+
+		// wave vector magnitude
+		Scalar k2 = h_gridk.data[idx].x*h_gridk.data[idx].x + h_gridk.data[idx].y*h_gridk.data[idx].y + h_gridk.data[idx].z*h_gridk.data[idx].z;
+
+		// term in the exponential
+		Scalar etak2 = (1.0-m_eta.x)*h_gridk.data[idx].x*h_gridk.data[idx].x + (1.0-m_eta.y)*h_gridk.data[idx].y*h_gridk.data[idx].y + (1.0-m_eta.z)*h_gridk.data[idx].z*h_gridk.data[idx].z;
+
+		// Scaling factor used in wave space sum.  k = 0 term is excluded.
+		if (i == 0 && j == 0 && k == 0){
+			h_scale_phiq.data[idx] = 0.0;
+		} else {
+			// Divided by total number of grid nodes due to the ifft conventions in cuFFT.
+			h_scale_phiq.data[idx] = pow(boost::math::sph_bessel(0,sqrt(k2)),2)*expf(-etak2/(4.0*m_xi*m_xi))/k2 / N_grid;
+		
+		} // end scaling if statement
+				
+	    } // end z component loop (k)
+	  } // end y component loop (j)
+	} // end x component loop (i)
+
+	////// Real space tables
+
+	m_drtable = double(0.001); // table spacing
+	m_N_table = m_rc/m_drtable - 1; // number of entries in the table
+
+	// Potential/charge real space table
+	GPUArray<Scalar2> n_phiq_table((m_N_table+1), exec_conf);
+	m_phiq_table.swap(n_phiq_table);
+	ArrayHandle<Scalar2> h_phiq_table(m_phiq_table, access_location::host, access_mode::readwrite);
+
+	// Potential/charge gradient real space table
+	GPUArray<Scalar2> n_gradphiq_table((m_N_table+1), exec_conf);
+	m_gradphiq_table.swap(n_gradphiq_table);
+	ArrayHandle<Scalar2> h_gradphiq_table(m_gradphiq_table, access_location::host, access_mode::readwrite);
+
+	// xi values
+	double xi = m_xi;
+	double xi2 = pow(xi,2);
+
+	// Fill the real space tables
+	for ( int i = 0; i <= m_N_table; i++)
+	{
+		// Particle separation corresponding to current table entry
+		double dist = (i + 1) * m_drtable;		
+		double dist2 = pow(dist,2);
+
+		// exponentials and complimentary error functions
+		double expp = exp(-(dist+2)*(dist+2)*xi2);		
+		double expm = exp(-(dist-2)*(dist-2)*xi2);
+		double exp0 = exp(-dist2*xi2);
+		double erfp = erfc((dist+2)*xi);
+		double erfm = erfc((dist-2)*xi);
+		double erf0 = erfc(dist*xi);
+
+		// Potential/charge table
+		double exppolyp = -(dist+2.)/(32.*pow(PI,1.5)*xi*dist);
+		double exppolym = -(dist-2.)/(32.*pow(PI,1.5)*xi*dist);
+		double exppoly0 = 1./(16.*pow(PI,1.5)*xi);
+		double erfpolyp = 1./(64.*PI*xi2*dist)*(2.*xi2*(dist+2.)*(dist+2.) + 1.);
+		double erfpolym = 1./(64.*PI*xi2*dist)*(2.*xi2*(dist-2.)*(dist-2.) + 1.);
+		double erfpoly0 = -(2.*xi2*dist2 + 1.)/(32.*PI*xi2*dist);
+
+		// Regularization for overlapping particles
+		double regpoly;
+		if (dist < 2) {
+			regpoly = -1./(4.*PI*dist) + (4.-dist)/(16.*PI);
+		} else {
+			regpoly = 0.;
+		}
+
+		// Enter the table values
+		h_phiq_table.data[i].x = Scalar(exppolyp*expp + exppolym*expm + exppoly0*exp0 + erfpolyp*erfp + erfpolym*erfm + erfpoly0*erf0 + regpoly);
+
+		// Potential/charge gradient table
+		exppolyp = -(dist-2.)/(32.*pow(PI,1.5)*xi*dist2);
+		exppolym = -(dist+2.)/(32.*pow(PI,1.5)*xi*dist2);
+		exppoly0 = 1./(16.*pow(PI,1.5)*xi*dist);
+		erfpolyp = (2.*xi2*dist2 - 8.*xi2 - 1.)/(64.*PI*xi2*dist2);
+		erfpolym = (2.*xi2*dist2 - 8.*xi2 - 1.)/(64.*PI*xi2*dist2);
+		erfpoly0 = -(2.*xi2*dist2 - 1.)/(32.*PI*xi2*dist2);
+
+		// Regularization for overlapping particles
+		if (dist < 2) {
+			regpoly =  1./(4.*PI*dist2) - 1./(16.*PI);
+		} else {
+			regpoly = 0.;
+		}
+
+		// Enter the table values
+		h_gradphiq_table.data[i].x = Scalar(exppolyp*expp + exppolym*expm + exppoly0*exp0 + erfpolyp*erfp + erfpolym*erfm + erfpoly0*erf0 + regpoly);
+
+	} // end table fill
+
+	// Set the .y fields of the ith entry to be the value of the .x fields of the i+1 entry.  This speeds up linear interpolation later.
+	for ( int i = 0; i < m_N_table; i++)
+	{
+		h_phiq_table.data[i].y = h_phiq_table.data[i+1].x;
+		h_gradphiq_table.data[i].y = h_gradphiq_table.data[i+1].x;
+	}
+
+	////// Initializations for needed arrays
+
+	// Isolated body potentials
+	GPUArray<Scalar> n_isolated_potential(m_N_isolated, exec_conf);
+	m_isolated_potential.swap(n_isolated_potential);
+	ArrayHandle<Scalar> h_isolated_potential(m_isolated_potential, access_location::host, access_mode::readwrite);
+
+	// Fill the potential array
+	for ( int i = 0; i < m_N_isolated; ++i ){
+		h_isolated_potential.data[i] = 0.0;
+	}
+
+	// Group membership list
+	GPUArray<unsigned int> n_group_membership(m_N_total, exec_conf);
+	m_group_membership.swap(n_group_membership);	
+
+	// Sorted isolated body membership list
+	GPUArray<unsigned int> n_isolated_membership(m_N_total, exec_conf);
+	m_isolated_membership.swap(n_isolated_membership);
+
+	// Objective output of the matrix/vector multiply
+	GPUArray<Scalar> n_objective(m_group_size + m_N_isolated, exec_conf);
+	m_objective.swap(n_objective);
+}
+
+// Update only the external field without recomputing any other values.
+void ConductorRigid::UpdateField(boost::python::list field) {
+
+	// Extract the new external field
+	m_extfield = make_scalar3(boost::python::extract<Scalar>(field[0]), boost::python::extract<Scalar>(field[1]), boost::python::extract<Scalar>(field[2]));
+
+}
+
+// Update parameters and recompute quantities on the CPU
+void ConductorRigid::UpdateParams(boost::python::list field,
+				      std::string fileprefix,
+				      int period,
+				      int t0) 
+{
+	// Set the new parameters
+	m_extfield = make_scalar3(boost::python::extract<Scalar>(field[0]), boost::python::extract<Scalar>(field[1]), boost::python::extract<Scalar>(field[2]));
+	m_fileprefix = fileprefix;
+	m_period = period;
+	m_t0 = t0;
+}
+
+// Compute forces on particles
+void ConductorRigid::computeForces(unsigned int timestep) {
+
+	// access the particle forces (associated with this plugin only; other forces are stored elsewhere)
+	ArrayHandle<Scalar4> d_bead_force(m_force, access_location::device, access_mode::readwrite);
+
+	// zero the particle forces
+	gpu_ZeroForce(m_N_total, d_bead_force.data, 512);
+
+	// update the neighbor list
+	m_nlist->compute(timestep);
+
+	// profile this step
+	if (m_prof)
+		m_prof->push(exec_conf, "ConductorRigid");
+
+	// Access all of the needed data.
+
+	// particle positions
+	ArrayHandle<Scalar4> d_bead_pos(m_pdata->getPositions(), access_location::device, access_mode::read);
+
+	// rigid body centers of mass
+	ArrayHandle<Scalar4> d_rigid_pos(m_rigid_data->getCOM(), access_location::device, access_mode::read);
+
+	// bead charges
+	ArrayHandle<Scalar> d_bead_charge(m_pdata->getCharges(), access_location::device, access_mode::readwrite);
+
+	// isolated body charge
+	ArrayHandle<Scalar> d_isolated_charge(m_isolated_charge, access_location::device, access_mode::read);
+
+	// isolated body potential
+	ArrayHandle<Scalar> d_isolated_potential(m_isolated_potential, access_location::device, access_mode::readwrite);
+
+	// particle tags
+	ArrayHandle<unsigned int> d_bead_tag(m_pdata->getTags(), access_location::device, access_mode::read);
+
+	// active group indices (NOT_MEMBER if particle is not in active group)
+	ArrayHandle<unsigned int> d_group_membership(m_group_membership, access_location::device, access_mode::readwrite);
+	
+	// particle indices in the active group
+	ArrayHandle<unsigned int> d_group_members(m_group->getIndexArray(), access_location::device, access_mode::read);
+
+	// tag of isolated body to which each particle belongs; accessed by particle tag
+	ArrayHandle<unsigned int> d_isolated_membership_unsrt(m_isolated_membership_unsrt, access_location::device, access_mode::read);
+
+	// tag of isolated body to which each particle belongs; accessed by particle global index
+	ArrayHandle<unsigned int> d_isolated_membership(m_isolated_membership, access_location::device, access_mode::readwrite);
+
+	// index of the rigid body to which each particle belongs; from HOOMD, NOT_MEMBER for isolated beads
+	ArrayHandle<unsigned int> d_rigid_membership(m_pdata->getBodies(), access_location::device, access_mode::read);
+
+	// bead indices contained in each rigid body
+	ArrayHandle<unsigned int> d_rigid_members(m_rigid_data->getParticleIndices(), access_location::device, access_mode::read);
+
+	// number of beads in each rigid body
+	ArrayHandle<unsigned int> d_rigid_size(m_rigid_data->getBodySize(), access_location::device, access_mode::read);
+
+	// maximum number of beads in a rigid body
+	int max_rigid_size = m_rigid_data->getNmax();
+
+	// simulation box dimensions
+	BoxDim box = m_pdata->getBox();
+
+	// objective output of the matrix/vector multiply
+	ArrayHandle<Scalar> d_objective(m_objective, access_location::device, access_mode::readwrite);
+
+	// potential/charge wave space grid
+	ArrayHandle<CUFFTCOMPLEX> d_qgrid(m_qgrid, access_location::device, access_mode::readwrite);
+
+	// potential/charge wave space scaling on grid
+	ArrayHandle<Scalar> d_scale_phiq(m_scale_phiq, access_location::device, access_mode::read);
+
+	// real space potential/charge table
+	ArrayHandle<Scalar2> d_phiq_table(m_phiq_table, access_location::device, access_mode::read);
+
+	// real space potential/charge gradient table
+	ArrayHandle<Scalar2> d_gradphiq_table(m_gradphiq_table, access_location::device, access_mode::read);
+
+	// neighbor list
+	ArrayHandle<unsigned int> d_nlist(m_nlist->getNListArray(), access_location::device, access_mode::read);
+
+	// index in neighbor list where each particle's neighbors begin
+	ArrayHandle<unsigned int> d_head_list(m_nlist->getHeadList(), access_location::device, access_mode::read);
+
+	// number of neighbors of each particle
+	ArrayHandle<unsigned int> d_n_neigh(m_nlist->getNNeighArray(), access_location::device, access_mode::read);
+
+	// set the block size of normal GPU kernels and the maximum block size for kernels requiring shared memory
+	int block_size = 512;
+	int max_block_size = 2048;  //12000; // (for 48kB max shared memory and 4B per float)
+
+	// perform the calculation on the GPU
+	gpu_ComputeForce(d_bead_pos.data,
+			 d_rigid_pos.data,
+			 d_bead_charge.data,
+			 d_bead_force.data,
+			 d_isolated_charge.data,
+			 d_isolated_potential.data,
+			 
+			 d_bead_tag.data,
+			 d_group_membership.data,
+			 d_group_members.data,
+			 d_isolated_membership_unsrt.data,	
+			 d_isolated_membership.data,
+			 d_rigid_membership.data,
+			 d_rigid_members.data,
+			 d_rigid_size.data,
+
+			 box,
+			 m_extfield,
+			 m_N_total,
+			 m_group_size,
+			 m_RigidGroup_size,
+			 m_N_rigid,
+			 m_N_isolated,
+			 max_rigid_size,
+			
+			 block_size,
+			 max_block_size,
+			 d_objective.data,
+
+			 m_xi,
+			 m_errortol,
+			 m_eta,
+			 m_rc,
+			 m_Nx,
+			 m_Ny,
+			 m_Nz,
+			 m_gridh,
+			 m_P,
+
+			 d_qgrid.data,
+			 d_scale_phiq.data,
+			 m_plan,
+
+			 m_N_table,
+			 m_drtable,
+			 d_phiq_table.data,
+			 d_gradphiq_table.data,
+
+			 d_nlist.data,
+			 d_head_list.data,
+			 d_n_neigh.data);
+
+	if (exec_conf->isCUDAErrorCheckingEnabled())
+		CHECK_CUDA_ERROR();
+
+	// If the period is set, create a file every period timesteps
+	if ( ( m_period > 0 ) && ( (int(timestep) - m_t0) % m_period == 0 ) ) {
+		OutputData(int(timestep));
+	}
+
+	// done profiling
+	if (m_prof)
+		m_prof->pop(exec_conf);
+}
+
+// Write quantities to file
+void ConductorRigid::OutputData(unsigned int timestep) {	
+
+	// Format the timestep to a string
+	std::ostringstream timestep_str;
+	timestep_str << std::setw(10) << std::setfill('0') << timestep;
+
+	// Construct the filename
+	std::string filename = m_fileprefix + "." + timestep_str.str() + ".txt";
+
+	// Access needed data
+	ArrayHandle<unsigned int> h_rtag(m_pdata->getRTags(), access_location::host, access_mode::read);
+	ArrayHandle<Scalar4> h_bead_pos(m_pdata->getPositions(), access_location::host, access_mode::read);
+	ArrayHandle<Scalar> h_bead_charge(m_pdata->getCharges(), access_location::host, access_mode::read);
+	ArrayHandle<Scalar4> h_bead_force(m_force, access_location::host, access_mode::read);
+
+	// Open the file
+	std::ofstream file;
+	file.open(filename.c_str(), std::ios_base::out);
+
+	// Check that the file opened correctly
+        if (!file.good()) {
+                throw std::runtime_error("Error in ConductorRigid: unable to open output file.");
+        }
+
+	////// Write the bead positions to file in global tag order
+
+	// Header
+	file << "Bead Position" << std::endl;
+
+	// Loop through particle tags
+	for (int i = 0; i < m_N_total; i++) {
+
+		// Get the particle's global index
+		unsigned int idx = h_rtag.data[i];
+
+		// Get the particle's position
+		Scalar4 postype = h_bead_pos.data[idx];
+
+		// Write the position to file
+		file << std::setprecision(10) << postype.x << "  " << postype.y << "  " << postype.z << "  " << std::endl;
+	}
+
+	////// Write the bead charges to file in global tag order
+	file << "Bead Charge" << std::endl;
+	for (int i = 0; i < m_N_total; i++) {
+
+		unsigned int idx = h_rtag.data[i];
+		Scalar charge = h_bead_charge.data[idx];
+		file << std::setprecision(10) << charge << std::endl;
+	}
+
+	////// Write the bead forces to file in global tag order
+	file << "Bead Force" << std::endl;
+	for (int i = 0; i < m_N_total; i++) {
+
+		unsigned int idx = h_rtag.data[i];
+		Scalar4 force = h_bead_force.data[idx];
+		file << std::setprecision(10) << force.x << "  " << force.y << "  " << force.z << "  " << std::endl;
+	}
+
+	// Close output file
+	file.close();
+}
+
+void export_ConductorRigid()
+    {
+    class_<ConductorRigid, boost::shared_ptr<ConductorRigid>, bases<ForceCompute>, boost::noncopyable>
+		("ConductorRigid", init< boost::shared_ptr<SystemDefinition>, boost::shared_ptr<ParticleGroup>, boost::shared_ptr<NeighborList>, boost::python::list, boost::python::list, boost::python::list, Scalar, Scalar, std::string, int, int >())
+		.def("SetParams", &ConductorRigid::SetParams)
+		.def("UpdateField", &ConductorRigid::UpdateField)
+		.def("UpdateParams", &ConductorRigid::UpdateParams)
+		.def("OutputData", &ConductorRigid::OutputData)
+        ;
+    }
+
+#ifdef WIN32
+#pragma warning( pop )
+#endif
